@@ -53,7 +53,7 @@ class PydapArrayWrapper(BackendArray):
     def _getitem(self, key):
         result = robust_getitem(self.array, key, catch=ValueError)
         # in some cases, pydap doesn't squeeze axes automatically like numpy
-        result = np.asarray(result)
+        result = np.asarray(result.data)  # --------- > this will modification
         axis = tuple(n for n, k in enumerate(key) if isinstance(k, integer_types))
         if result.ndim + len(axis) != self.array.ndim and axis:
             result = np.squeeze(result, axis)
@@ -90,6 +90,9 @@ class PydapDataStore(AbstractDataStore):
         """
         self.dataset = dataset
         self.group = group
+        self._dimension_batch_done = False
+        self._dimension_cache = {}
+        self._dimension_batch_promise = None
 
     @classmethod
     def open(
@@ -138,7 +141,6 @@ class PydapDataStore(AbstractDataStore):
         return cls(**args)
 
     def open_store_variable(self, var):
-        data = indexing.LazilyIndexedArray(PydapArrayWrapper(var))
         try:
             dimensions = [
                 dim.split("/")[-1] if dim.startswith("/") else dim for dim in var.dims
@@ -147,6 +149,16 @@ class PydapDataStore(AbstractDataStore):
             # GridType does not have a dims attribute - instead get `dimensions`
             # see https://github.com/pydap/pydap/issues/485
             dimensions = var.dimensions
+        if (
+            var.name in dimensions
+            and hasattr(var, "dataset")
+            and var.dataset._batch_mode
+        ):
+            data_array = self._get_dimension_data_array(var)
+            data = indexing.LazilyIndexedArray(data_array)
+        else:
+            data = indexing.LazilyIndexedArray(PydapArrayWrapper(var))
+
         return Variable(dimensions, data, var.attributes)
 
     def get_variables(self):
@@ -164,6 +176,7 @@ class PydapDataStore(AbstractDataStore):
                 # check the key is not a BaseType or GridType
                 if not isinstance(self.ds[var], GroupType)
             ]
+
         return FrozenDict((k, self.open_store_variable(self.ds[k])) for k in _vars)
 
     def get_attrs(self):
@@ -186,6 +199,42 @@ class PydapDataStore(AbstractDataStore):
     @property
     def ds(self):
         return get_group(self.dataset, self.group)
+
+    def _register_all_dimensions_for_batch(self):
+        from pydap.model import BatchPromise
+
+        if self._dimension_batch_done:
+            return
+
+        # initialize the batching - same instance at var level, and at root level
+        self._dimension_batch_promise = self.ds.dataset._current_batch_promise = (
+            BatchPromise()
+        )
+        for dim_name in self.ds.dimensions:
+            if dim_name in self.ds.keys():
+                var = self.ds[dim_name]
+                if not var._is_data_loaded():
+                    var._pending_batch_slice = slice(None)
+                    self.ds.dataset.register_for_batch(var)
+
+        self.ds.dataset._start_batch_timer()
+        self._dimension_batch_done = True
+
+    def _get_dimension_data_array(self, var):
+        if not self._dimension_batch_done:
+            self._register_all_dimensions_for_batch()
+            self.ds.dataset._current_batch_promise._event.wait()
+
+            # Fill cache with dimensions as they come
+            for dim in self.ds.dimensions:
+                if dim in self.ds.keys():
+                    _future_data = self._dimension_batch_promise.wait_for_result(
+                        self.ds[dim].id
+                    )
+                    self._dimension_cache[dim] = np.asarray(_future_data)
+
+            self._dimension_cache_done = True
+        return self._dimension_cache[var.name]
 
 
 class PydapBackendEntrypoint(BackendEntrypoint):
