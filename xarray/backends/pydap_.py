@@ -51,9 +51,16 @@ class PydapArrayWrapper(BackendArray):
         )
 
     def _getitem(self, key):
+        if hasattr(self.array, "_pending_batch_slice"):
+            if self.array._pending_batch_slice is None:
+                # update the pending slice (pydap backend)
+                self.array._pending_batch_slice = key
         result = robust_getitem(self.array, key, catch=ValueError)
         # in some cases, pydap doesn't squeeze axes automatically like numpy
-        result = np.asarray(result.data)  # --------- > this will modification
+        try:
+            result = np.asarray(result.data)
+        except AttributeError:
+            result = np.asarray(result)
         axis = tuple(n for n, k in enumerate(key) if isinstance(k, integer_types))
         if result.ndim + len(axis) != self.array.ndim and axis:
             result = np.squeeze(result, axis)
@@ -80,7 +87,7 @@ class PydapDataStore(AbstractDataStore):
     be useful if the netCDF4 library is not available.
     """
 
-    def __init__(self, dataset, group=None):
+    def __init__(self, dataset, group=None, session=None):
         """
         Parameters
         ----------
@@ -90,6 +97,7 @@ class PydapDataStore(AbstractDataStore):
         """
         self.dataset = dataset
         self.group = group
+        self.session = session
         self._dimension_batch_done = False
         self._dimension_cache = {}
         self._dimension_batch_promise = None
@@ -149,14 +157,14 @@ class PydapDataStore(AbstractDataStore):
             # GridType does not have a dims attribute - instead get `dimensions`
             # see https://github.com/pydap/pydap/issues/485
             dimensions = var.dimensions
-        if (
-            var.name in dimensions
-            and hasattr(var, "dataset")
-            and var.dataset._batch_mode
+        if var.name in dimensions and var.id != var.dataset.session.headers.get(
+            "concat_dim", None
         ):
+            # if the variable is a dimension, we need to register it
             data_array = self._get_dimension_data_array(var)
             data = indexing.LazilyIndexedArray(data_array)
         else:
+            # all non-dimension variables
             data = indexing.LazilyIndexedArray(PydapArrayWrapper(var))
 
         return Variable(dimensions, data, var.attributes)
@@ -212,13 +220,14 @@ class PydapDataStore(AbstractDataStore):
         self._dimension_batch_promise = self.ds.dataset._current_batch_promise = (
             BatchPromise()
         )
+        concat_dim = self.ds.dataset.session.headers.get("concat_dim", None)
         for dim_name in self.ds.dimensions:
             if dim_name in self.ds.keys():
                 var = self.ds[dim_name]
-                if not var._is_data_loaded():
+                if not var._is_data_loaded() and var.id != concat_dim:
                     var._pending_batch_slice = slice(None)
                     self.ds.dataset.register_for_batch(var)
-
+                    self.ds[dim_name]._is_registered_for_batch = True
         self.ds.dataset._start_batch_timer()
         self._dimension_batch_done = True
 
@@ -228,8 +237,11 @@ class PydapDataStore(AbstractDataStore):
             self.ds.dataset._current_batch_promise._event.wait()
 
             # Fill cache with dimensions as they come
+            concat_dim = self.ds.dataset.session.headers.get("concat_dim", None)
+            if concat_dim is not None:
+                concat_dim = concat_dim.split("/")[-1]
             for dim in self.ds.dimensions:
-                if dim in self.ds.keys():
+                if dim in self.ds.keys() and dim != concat_dim:
                     _future_data = self._dimension_batch_promise.wait_for_result(
                         self.ds[dim].id
                     )
