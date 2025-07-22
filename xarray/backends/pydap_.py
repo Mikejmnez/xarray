@@ -23,7 +23,6 @@ from xarray.core.utils import (
     is_remote_uri,
 )
 from xarray.core.variable import Variable
-from xarray.namedarray.pycompat import integer_types
 
 if TYPE_CHECKING:
     import os
@@ -50,21 +49,50 @@ class PydapArrayWrapper(BackendArray):
             key, self.shape, indexing.IndexingSupport.BASIC, self._getitem
         )
 
-    def _getitem(self, key):
-        if hasattr(self.array, "_pending_batch_slice"):
-            if self.array._pending_batch_slice is None:
-                # update the pending slice (pydap backend)
-                self.array._pending_batch_slice = key
-        result = robust_getitem(self.array, key, catch=ValueError)
-        # in some cases, pydap doesn't squeeze axes automatically like numpy
-        try:
-            result = np.asarray(result.data)
-        except AttributeError:
-            result = np.asarray(result)
-        axis = tuple(n for n, k in enumerate(key) if isinstance(k, integer_types))
-        if result.ndim + len(axis) != self.array.ndim and axis:
-            result = np.squeeze(result, axis)
+    # def _getitem(self, key):
+    #     print(self.array.id, key)
+    #     if hasattr(self.array, "_pending_batch_slice"):
+    #         if self.array._pending_batch_slice is None:
+    #             # update the pending slice (pydap backend)
+    #             self.array._pending_batch_slice = key
+    #     result = robust_getitem(self.array, key, catch=ValueError)
+    #     # in some cases, pydap doesn't squeeze axes automatically like numpy
+    #     try:
+    #         result = np.asarray(result.data)
+    #     except AttributeError:
+    #         result = np.asarray(result)
+    #     axis = tuple(n for n, k in enumerate(key) if isinstance(k, integer_types))
+    #     if result.ndim + len(axis) != self.array.ndim and axis:
+    #         result = np.squeeze(result, axis)
 
+    #     return result
+
+    def _getitem(self, key):
+        from pydap.model import BatchPromise
+
+        # If batch mode is enabled
+        if (
+            hasattr(self.array, "dataset")
+            and hasattr(self.array.dataset, "is_batch_mode")
+            and self.array.dataset.is_batch_mode()
+        ):
+            self.array._pending_batch_slice = key
+            self.array._batch_promise = self.array.dataset._current_batch_promise = (
+                BatchPromise()
+            )
+            self.array.dataset.register_for_batch(self.array)
+            self.array.dataset._start_batch_timer()
+            result = np.squeeze(
+                np.asarray(self.array._batch_promise.wait_for_result(self.array.id))
+            )
+            self.array._pending_batch_slice = None
+        else:
+            # Fallback if batch is disabled
+            result = robust_getitem(self.array, key, catch=ValueError)
+            try:
+                result = np.asarray(result.data)
+            except AttributeError:
+                result = np.asarray(result)
         return result
 
 
@@ -157,8 +185,11 @@ class PydapDataStore(AbstractDataStore):
             # GridType does not have a dims attribute - instead get `dimensions`
             # see https://github.com/pydap/pydap/issues/485
             dimensions = var.dimensions
-        if var.name in dimensions and var.id != var.dataset.session.headers.get(
-            "concat_dim", None
+        if (
+            var.name in dimensions
+            and hasattr(var, "dataset")
+            and hasattr(var.dataset, "session")
+            and var.id != var.dataset.session.headers.get("concat_dim", None)
         ):
             # if the variable is a dimension, we need to register it
             data_array = self._get_dimension_data_array(var)
