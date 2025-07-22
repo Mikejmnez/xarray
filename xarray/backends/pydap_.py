@@ -23,6 +23,7 @@ from xarray.core.utils import (
     is_remote_uri,
 )
 from xarray.core.variable import Variable
+from xarray.namedarray.pycompat import integer_types
 
 if TYPE_CHECKING:
     import os
@@ -82,8 +83,8 @@ class PydapArrayWrapper(BackendArray):
             )
             self.array.dataset.register_for_batch(self.array)
             self.array.dataset._start_batch_timer()
-            result = np.squeeze(
-                np.asarray(self.array._batch_promise.wait_for_result(self.array.id))
+            result = np.asarray(
+                self.array._batch_promise.wait_for_result(self.array.id)
             )
             self.array._pending_batch_slice = None
         else:
@@ -93,6 +94,9 @@ class PydapArrayWrapper(BackendArray):
                 result = np.asarray(result.data)
             except AttributeError:
                 result = np.asarray(result)
+        axis = tuple(n for n, k in enumerate(key) if isinstance(k, integer_types))
+        if result.ndim + len(axis) != self.array.ndim and axis:
+            result = np.squeeze(result, axis)
         return result
 
 
