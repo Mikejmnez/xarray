@@ -57,7 +57,9 @@ class PydapArrayWrapper(BackendArray):
             from pydap.model import BatchPromise
 
             ds = self.array.dataset  # root
-            parent = self.array.parent  # could be root ds | group
+            parent = (
+                self.array.parent if self.array.parent else ds
+            )  # could be root ds | group
             if ds._current_batch_promise is None:
                 ds._current_batch_promise = BatchPromise()
                 for name in list(parent.variables()):
@@ -163,7 +165,6 @@ class PydapDataStore(AbstractDataStore):
             "timeout": timeout or DEFAULT_TIMEOUT,
             "verify": verify or True,
             "user_charset": user_charset,
-            "batch": batch,
         }
         if isinstance(url, str):
             # check uit begins with an acceptable scheme
@@ -176,7 +177,6 @@ class PydapDataStore(AbstractDataStore):
             # only then, change the default
             args["group"] = group
         if batch:
-            # if batch is True, we will register all variables for batch
             args["batch"] = batch
         return cls(**args)
 
@@ -189,14 +189,10 @@ class PydapDataStore(AbstractDataStore):
             # GridType does not have a dims attribute - instead get `dimensions`
             # see https://github.com/pydap/pydap/issues/485
             dimensions = var.dimensions
-        if (
-            self._batch
-            and var.name in dimensions
-            and hasattr(var, "dataset")
-            and hasattr(var.dataset, "session")
-            # and var.id != var.dataset.session.headers.get("concat_dim", None)
-        ):
+        if self._batch and var.name in dimensions and hasattr(var, "dataset"):
             # if the variable is a dimension, we need to register it
+            if not var.dataset._batch_mode:
+                var.dataset.enable_batch_mode()
             data_array = self._get_data_array(var)
             data = indexing.LazilyIndexedArray(data_array)
         else:
@@ -270,7 +266,7 @@ class PydapDataStore(AbstractDataStore):
     def _get_data_array(self, var):
         if not self._batch_done:
             concat_dim = self.ds.dataset.session.headers.get("concat_dim", None)
-            dimensions = self.ds.dimensions
+            dimensions = sorted(self.ds.dimensions)
             self._register_all_for_batch(dimensions, concat_dim)
             self.ds.dataset._current_batch_promise._event.wait()
 
