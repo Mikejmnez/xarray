@@ -53,21 +53,16 @@ class PydapArrayWrapper(BackendArray):
 
     def _getitem(self, key):
         # If batch mode is enabled
-        if (
-            self._batch
-            and hasattr(self.array, "dataset")
-            and self.array.id != self.array.dataset.session.headers.get("concat_dim")
-        ):
+        if self._batch and hasattr(self.array, "dataset"):
             from pydap.model import BatchPromise
 
-            ds = self.array.dataset
-
-            # Create a new batch promise if one doesn't exist
+            ds = self.array.dataset  # root
+            parent = self.array.parent  # could be root ds | group
             if ds._current_batch_promise is None:
                 ds._current_batch_promise = BatchPromise()
-                for name in list(ds.variables()):
-                    var = ds[name]
-                    if var.name not in ds.dimensions and not var._is_data_loaded():
+                for name in list(parent.variables()):
+                    var = parent[name]
+                    if var.name not in parent.dimensions and not var._is_data_loaded():
                         var._pending_batch_slice = key
                         var._batch_promise = ds._current_batch_promise
                         ds.register_for_batch(var)
@@ -86,12 +81,12 @@ class PydapArrayWrapper(BackendArray):
         else:
             # Fallback if batch is disabled
             result = robust_getitem(self.array, key, catch=ValueError)
-            if hasattr(self.array, "dataset"):
-                self.array.dataset._current_batch_promise = None
             try:
                 result = np.asarray(result.data)
             except AttributeError:
                 result = np.asarray(result)
+            if hasattr(self.array, "dataset"):
+                self.array.dataset._current_batch_promise = None
         axis = tuple(n for n, k in enumerate(key) if isinstance(k, integer_types))
         if result.ndim + len(axis) != self.array.ndim and axis:
             result = np.squeeze(result, axis)
@@ -199,7 +194,7 @@ class PydapDataStore(AbstractDataStore):
             and var.name in dimensions
             and hasattr(var, "dataset")
             and hasattr(var.dataset, "session")
-            and var.id != var.dataset.session.headers.get("concat_dim", None)
+            # and var.id != var.dataset.session.headers.get("concat_dim", None)
         ):
             # if the variable is a dimension, we need to register it
             data_array = self._get_data_array(var)
@@ -251,7 +246,7 @@ class PydapDataStore(AbstractDataStore):
     def ds(self):
         return get_group(self.dataset, self.group)
 
-    def _register_all_for_batch(self):
+    def _register_all_for_batch(self, dims, concat_dim=None):
         from pydap.model import BatchPromise
 
         if self._batch_done:
@@ -260,38 +255,48 @@ class PydapDataStore(AbstractDataStore):
         self._array_batch_promise = self.ds.dataset._current_batch_promise = (
             BatchPromise()
         )
-        concat_dim = self.ds.dataset.session.headers.get("concat_dim", None)
 
-        for name in self.ds.dataset.dimensions:
-            if name in self.ds.dataset.keys():
-                var = self.ds.dataset[name]
+        for name in dims:
+            if name in self.ds.keys():
+                var = self.ds[name]
                 if not var._is_data_loaded() and var.id != concat_dim:
                     var._pending_batch_slice = slice(None)
                     self.ds.dataset.register_for_batch(var)
-                    self.ds.dataset[name]._is_registered_for_batch = True
+                    self.ds[name]._is_registered_for_batch = True
         self.ds.dataset._start_batch_timer()
 
         self._batch_done = True
 
     def _get_data_array(self, var):
         if not self._batch_done:
-            self._register_all_for_batch()
+            concat_dim = self.ds.dataset.session.headers.get("concat_dim", None)
+            dimensions = self.ds.dimensions
+            self._register_all_for_batch(dimensions, concat_dim)
             self.ds.dataset._current_batch_promise._event.wait()
 
             # Fill cache with dimensions as they come
-            concat_dim = self.ds.dataset.session.headers.get("concat_dim", None)
+
             if concat_dim is not None:
                 concat_dim = concat_dim.split("/")[-1]
 
-            for name in self.ds.dataset.dimensions:
-                if name in self.ds.dataset.keys() and name != concat_dim:
+            for name in dimensions:
+                if name in self.ds.keys() and name != concat_dim:
                     _future_data = self._array_batch_promise.wait_for_result(
-                        self.ds.dataset[name].id
+                        self.ds[name].id
                     )
                     self._array_cache[name] = np.asarray(_future_data)
 
-        self.ds.dataset._current_batch_promise = None  # force to None
-
+            self.ds.dataset._current_batch_promise = None  # force to None
+            # if there is a concat dim - process it now
+            if concat_dim:  # string value
+                self._batch_done = False
+                self._register_all_for_batch([concat_dim])  # register it
+                self.ds.dataset._current_batch_promise._event.wait()
+                _future_data = self._array_batch_promise.wait_for_result(
+                    self.ds[concat_dim].id
+                )
+                self._array_cache[concat_dim] = np.asarray(_future_data)
+                self.ds.dataset._current_batch_promise = None  # force to None
         return self._array_cache[var.name]
 
 
