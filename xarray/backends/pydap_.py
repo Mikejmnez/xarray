@@ -34,8 +34,9 @@ if TYPE_CHECKING:
 
 
 class PydapArrayWrapper(BackendArray):
-    def __init__(self, array):
+    def __init__(self, array, batch=False):
         self.array = array
+        self._batch = batch
 
     @property
     def shape(self) -> tuple[int, ...]:
@@ -50,46 +51,43 @@ class PydapArrayWrapper(BackendArray):
             key, self.shape, indexing.IndexingSupport.BASIC, self._getitem
         )
 
-    # def _getitem(self, key):
-    #     print(self.array.id, key)
-    #     if hasattr(self.array, "_pending_batch_slice"):
-    #         if self.array._pending_batch_slice is None:
-    #             # update the pending slice (pydap backend)
-    #             self.array._pending_batch_slice = key
-    #     result = robust_getitem(self.array, key, catch=ValueError)
-    #     # in some cases, pydap doesn't squeeze axes automatically like numpy
-    #     try:
-    #         result = np.asarray(result.data)
-    #     except AttributeError:
-    #         result = np.asarray(result)
-    #     axis = tuple(n for n, k in enumerate(key) if isinstance(k, integer_types))
-    #     if result.ndim + len(axis) != self.array.ndim and axis:
-    #         result = np.squeeze(result, axis)
-
-    #     return result
-
     def _getitem(self, key):
-        from pydap.model import BatchPromise
-
         # If batch mode is enabled
         if (
-            hasattr(self.array, "dataset")
-            and hasattr(self.array.dataset, "is_batch_mode")
-            and self.array.dataset.is_batch_mode()
+            self._batch
+            and hasattr(self.array, "dataset")
+            and self.array.id != self.array.dataset.session.headers.get("concat_dim")
         ):
-            self.array._pending_batch_slice = key
-            self.array._batch_promise = self.array.dataset._current_batch_promise = (
-                BatchPromise()
-            )
-            self.array.dataset.register_for_batch(self.array)
-            self.array.dataset._start_batch_timer()
+            from pydap.model import BatchPromise
+
+            ds = self.array.dataset
+
+            # Create a new batch promise if one doesn't exist
+            if ds._current_batch_promise is None:
+                ds._current_batch_promise = BatchPromise()
+                for name in list(ds.variables()):
+                    var = ds[name]
+                    if var.name not in ds.dimensions and not var._is_data_loaded():
+                        var._pending_batch_slice = key
+                        var._batch_promise = ds._current_batch_promise
+                        ds.register_for_batch(var)
+
+                # Start resolution
+                ds._start_batch_timer()
+
+            # Wait for result
             result = np.asarray(
-                self.array._batch_promise.wait_for_result(self.array.id)
+                ds._current_batch_promise.wait_for_result(self.array.id)
             )
+
+            # Clean up this variable
             self.array._pending_batch_slice = None
+
         else:
             # Fallback if batch is disabled
             result = robust_getitem(self.array, key, catch=ValueError)
+            if hasattr(self.array, "dataset"):
+                self.array.dataset._current_batch_promise = None
             try:
                 result = np.asarray(result.data)
             except AttributeError:
@@ -119,7 +117,7 @@ class PydapDataStore(AbstractDataStore):
     be useful if the netCDF4 library is not available.
     """
 
-    def __init__(self, dataset, group=None, session=None):
+    def __init__(self, dataset, group=None, session=None, batch=False):
         """
         Parameters
         ----------
@@ -130,9 +128,10 @@ class PydapDataStore(AbstractDataStore):
         self.dataset = dataset
         self.group = group
         self.session = session
-        self._dimension_batch_done = False
-        self._dimension_cache = {}
-        self._dimension_batch_promise = None
+        self._batch = batch
+        self._batch_done = False
+        self._array_cache = {}
+        self._array_batch_promise = None
 
     @classmethod
     def open(
@@ -145,6 +144,7 @@ class PydapDataStore(AbstractDataStore):
         timeout=None,
         verify=None,
         user_charset=None,
+        batch=False,
     ):
         from pydap.client import open_url
         from pydap.net import DEFAULT_TIMEOUT
@@ -159,6 +159,7 @@ class PydapDataStore(AbstractDataStore):
                 DeprecationWarning,
             )
             output_grid = False  # new default behavior
+
         kwargs = {
             "url": url,
             "application": application,
@@ -167,6 +168,7 @@ class PydapDataStore(AbstractDataStore):
             "timeout": timeout or DEFAULT_TIMEOUT,
             "verify": verify or True,
             "user_charset": user_charset,
+            "batch": batch,
         }
         if isinstance(url, str):
             # check uit begins with an acceptable scheme
@@ -178,6 +180,9 @@ class PydapDataStore(AbstractDataStore):
         if group:
             # only then, change the default
             args["group"] = group
+        if batch:
+            # if batch is True, we will register all variables for batch
+            args["batch"] = batch
         return cls(**args)
 
     def open_store_variable(self, var):
@@ -190,17 +195,18 @@ class PydapDataStore(AbstractDataStore):
             # see https://github.com/pydap/pydap/issues/485
             dimensions = var.dimensions
         if (
-            var.name in dimensions
+            self._batch
+            and var.name in dimensions
             and hasattr(var, "dataset")
             and hasattr(var.dataset, "session")
             and var.id != var.dataset.session.headers.get("concat_dim", None)
         ):
             # if the variable is a dimension, we need to register it
-            data_array = self._get_dimension_data_array(var)
+            data_array = self._get_data_array(var)
             data = indexing.LazilyIndexedArray(data_array)
         else:
             # all non-dimension variables
-            data = indexing.LazilyIndexedArray(PydapArrayWrapper(var))
+            data = indexing.LazilyIndexedArray(PydapArrayWrapper(var, self._batch))
 
         return Variable(dimensions, data, var.attributes)
 
@@ -245,45 +251,48 @@ class PydapDataStore(AbstractDataStore):
     def ds(self):
         return get_group(self.dataset, self.group)
 
-    def _register_all_dimensions_for_batch(self):
+    def _register_all_for_batch(self):
         from pydap.model import BatchPromise
 
-        if self._dimension_batch_done:
+        if self._batch_done:
             return
 
-        # initialize the batching - same instance at var level, and at root level
-        self._dimension_batch_promise = self.ds.dataset._current_batch_promise = (
+        self._array_batch_promise = self.ds.dataset._current_batch_promise = (
             BatchPromise()
         )
         concat_dim = self.ds.dataset.session.headers.get("concat_dim", None)
-        for dim_name in self.ds.dimensions:
-            if dim_name in self.ds.keys():
-                var = self.ds[dim_name]
+
+        for name in self.ds.dataset.dimensions:
+            if name in self.ds.dataset.keys():
+                var = self.ds.dataset[name]
                 if not var._is_data_loaded() and var.id != concat_dim:
                     var._pending_batch_slice = slice(None)
                     self.ds.dataset.register_for_batch(var)
-                    self.ds[dim_name]._is_registered_for_batch = True
+                    self.ds.dataset[name]._is_registered_for_batch = True
         self.ds.dataset._start_batch_timer()
-        self._dimension_batch_done = True
 
-    def _get_dimension_data_array(self, var):
-        if not self._dimension_batch_done:
-            self._register_all_dimensions_for_batch()
+        self._batch_done = True
+
+    def _get_data_array(self, var):
+        if not self._batch_done:
+            self._register_all_for_batch()
             self.ds.dataset._current_batch_promise._event.wait()
 
             # Fill cache with dimensions as they come
             concat_dim = self.ds.dataset.session.headers.get("concat_dim", None)
             if concat_dim is not None:
                 concat_dim = concat_dim.split("/")[-1]
-            for dim in self.ds.dimensions:
-                if dim in self.ds.keys() and dim != concat_dim:
-                    _future_data = self._dimension_batch_promise.wait_for_result(
-                        self.ds[dim].id
-                    )
-                    self._dimension_cache[dim] = np.asarray(_future_data)
 
-            self._dimension_cache_done = True
-        return self._dimension_cache[var.name]
+            for name in self.ds.dataset.dimensions:
+                if name in self.ds.dataset.keys() and name != concat_dim:
+                    _future_data = self._array_batch_promise.wait_for_result(
+                        self.ds.dataset[name].id
+                    )
+                    self._array_cache[name] = np.asarray(_future_data)
+
+        self.ds.dataset._current_batch_promise = None  # force to None
+
+        return self._array_cache[var.name]
 
 
 class PydapBackendEntrypoint(BackendEntrypoint):
@@ -329,6 +338,7 @@ class PydapBackendEntrypoint(BackendEntrypoint):
         timeout=None,
         verify=None,
         user_charset=None,
+        batch=False,
     ) -> Dataset:
         store = PydapDataStore.open(
             url=filename_or_obj,
@@ -339,6 +349,7 @@ class PydapBackendEntrypoint(BackendEntrypoint):
             timeout=timeout,
             verify=verify,
             user_charset=user_charset,
+            batch=batch,
         )
         store_entrypoint = StoreBackendEntrypoint()
         with close_on_error(store):
@@ -371,6 +382,7 @@ class PydapBackendEntrypoint(BackendEntrypoint):
         timeout=None,
         verify=None,
         user_charset=None,
+        batch=False,
     ) -> DataTree:
         groups_dict = self.open_groups_as_dict(
             filename_or_obj,
@@ -408,6 +420,7 @@ class PydapBackendEntrypoint(BackendEntrypoint):
         timeout=None,
         verify=None,
         user_charset=None,
+        batch=False,
     ) -> dict[str, Dataset]:
         from xarray.core.treenode import NodePath
 
@@ -419,6 +432,7 @@ class PydapBackendEntrypoint(BackendEntrypoint):
             timeout=timeout,
             verify=verify,
             user_charset=user_charset,
+            batch=batch,
         )
 
         # Check for a group and make it a parent if it exists
