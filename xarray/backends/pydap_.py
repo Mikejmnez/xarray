@@ -261,8 +261,6 @@ class PydapDataStore(AbstractDataStore):
                     self.ds[name]._is_registered_for_batch = True
         self.ds.dataset._start_batch_timer()
 
-        self._batch_done = True
-
     def _get_data_array(self, var):
         if not self._batch_done:
             concat_dim = self.ds.dataset.session.headers.get("concat_dim", None)
@@ -293,6 +291,8 @@ class PydapDataStore(AbstractDataStore):
                 )
                 self._array_cache[concat_dim] = np.asarray(_future_data)
                 self.ds.dataset._current_batch_promise = None  # force to None
+            self._batch_done = True
+
         return self._array_cache[var.name]
 
 
