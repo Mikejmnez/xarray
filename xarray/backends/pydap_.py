@@ -265,32 +265,63 @@ class PydapDataStore(AbstractDataStore):
         if not self._batch_done:
             concat_dim = self.ds.dataset.session.headers.get("concat_dim", None)
             dimensions = sorted(self.ds.dimensions)
-            self._register_all_for_batch(dimensions, concat_dim)
-            self.ds.dataset._current_batch_promise._event.wait()
-
-            # Fill cache with dimensions as they come
-
-            if concat_dim is not None:
-                concat_dim = concat_dim.split("/")[-1]
-
-            for name in dimensions:
-                if name in self.ds.keys() and name != concat_dim:
-                    _future_data = self._array_batch_promise.wait_for_result(
-                        self.ds[name].id
-                    )
-                    self._array_cache[name] = np.asarray(_future_data)
-
-            self.ds.dataset._current_batch_promise = None  # force to None
-            # if there is a concat dim - process it now
-            if concat_dim:  # string value
-                self._batch_done = False
-                self._register_all_for_batch([concat_dim])  # register it
+            if "consolidated" not in self.ds.dataset.session.headers.keys():
+                self._register_all_for_batch(dimensions, concat_dim)
                 self.ds.dataset._current_batch_promise._event.wait()
-                _future_data = self._array_batch_promise.wait_for_result(
-                    self.ds[concat_dim].id
-                )
-                self._array_cache[concat_dim] = np.asarray(_future_data)
+                # Fill cache with dimensions as they come
+
+                if concat_dim is not None:
+                    concat_dim = concat_dim.split("/")[-1]
+
+                for name in dimensions:
+                    if name in self.ds.keys() and name != concat_dim:
+                        _future_data = self._array_batch_promise.wait_for_result(
+                            self.ds[name].id
+                        )
+                        self._array_cache[name] = np.asarray(_future_data)
+
                 self.ds.dataset._current_batch_promise = None  # force to None
+                # if there is a concat dim - process it now
+                if concat_dim:  # string value
+                    self._batch_done = False
+                    self._register_all_for_batch([concat_dim])  # register it
+                    self.ds.dataset._current_batch_promise._event.wait()
+                    _future_data = self._array_batch_promise.wait_for_result(
+                        self.ds[concat_dim].id
+                    )
+                    self._array_cache[concat_dim] = np.asarray(_future_data)
+                    self.ds.dataset._current_batch_promise = None  # force to None
+            else:
+                try:
+                    return self._array_cache[var.name]
+                except KeyError:
+                    # get all dims at once
+                    from pydap.handlers.dap import UNPACKDAP4DATA
+
+                    sess = var.dataset.session
+                    if concat_dim:
+                        if concat_dim[0] == "/":
+                            concat_dim = concat_dim[1:]
+                        all_urls = sess.cache.urls()
+                        data_url = var.data.baseurl + ".dap"
+                        cdim_url = [
+                            url
+                            for url in all_urls
+                            if url.split("?")[0] == data_url
+                            and concat_dim in url.split("?dap4.ce=")[1]
+                        ]
+                        r = sess.get(cdim_url[0])
+                        cpyds = UNPACKDAP4DATA(r).dataset
+                        self._array_cache[concat_dim] = np.asarray(
+                            cpyds[concat_dim].data
+                        )
+                    dims_url = sess.headers["consolidated"]
+                    r = sess.get(dims_url)
+                    pyds = UNPACKDAP4DATA(r, checksum=True).dataset
+                    for name in pyds.keys():
+                        _dim_var = pyds[name]
+                        self._array_cache[name] = np.asarray(_dim_var.data)
+                    return self._array_cache[var.name]
             self._batch_done = True
 
         return self._array_cache[var.name]
