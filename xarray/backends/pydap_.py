@@ -54,31 +54,19 @@ class PydapArrayWrapper(BackendArray):
     def _getitem(self, key):
         # If batch mode is enabled
         if self._batch and hasattr(self.array, "dataset"):
-            from pydap.lib import BatchPromise
+            from pydap.lib import resolve_batch_for_all_variables
 
             pyds = self.array.dataset  # root pydap dataset / needed even gor groups
             parent = (
                 self.array.parent if self.array.parent else pyds
             )  # could be root ds | group
             if pyds._current_batch_promise is None:
-                pyds._current_batch_promise = BatchPromise()
-                for name in list(parent.variables()):
-                    var = parent[name]
-                    if var.name not in parent.dimensions and not var._is_data_loaded():
-                        var._pending_batch_slice = key
-                        var._batch_promise = pyds._current_batch_promise
-                        pyds.register_for_batch(var)
+                resolve_batch_for_all_variables(pyds, parent, key)
 
-                # Start resolution
-                pyds._start_batch_timer()
-
-            # Wait for result
+            # # Wait for result
             result = np.asarray(
                 pyds._current_batch_promise.wait_for_result(self.array.id)
             )
-
-            # Clean up this variable
-            self.array._pending_batch_slice = None
 
         else:
             # Fallback if batch is disabled
@@ -91,30 +79,6 @@ class PydapArrayWrapper(BackendArray):
         if result.ndim + len(axis) != self.array.ndim and axis:
             result = np.squeeze(result, axis)
         return result
-
-    # def _getitem(self, key):
-    #     # If batch mode is enabled
-    #     if self._batch and hasattr(self.array, "dataset"):
-    #         from pydap.lib import resolve_batch_for_all_variables
-
-    #         pyds = self.array.dataset  # root object / need it even for groups
-    #         parent = self.array.parent  if self.array.parent else pyds
-    #         promise = resolve_batch_for_all_variables(pyds, parent, key)
-    #         result = np.asarray(promise.wait_for_result(self.array.id))
-    #             # Clean up this variable
-    #         self.array._pending_batch_slice = None
-
-    #     else:
-    #         # Fallback if batch is disabled
-    #         result = robust_getitem(self.array, key, catch=ValueError)
-    #         try:
-    #             result = np.asarray(result.data)
-    #         except AttributeError:
-    #             result = np.asarray(result)
-    #     axis = tuple(n for n, k in enumerate(key) if isinstance(k, integer_types))
-    #     if result.ndim + len(axis) != self.array.ndim and axis:
-    #         result = np.squeeze(result, axis)
-    #     return result
 
 
 def get_group(ds, group):
